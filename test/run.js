@@ -11147,6 +11147,87 @@ test('screenshot click scale: from_screenshot converts image px to CSS px', () =
   }
 });
 
+test('coord click loop: helper resolves the CSS-pixel point the click dispatches', () => {
+  for (const AgentClass of [AgentCh, AgentFx]) {
+    const agent = new AgentClass({});
+    const tabId = 9;
+    agent.screenshotClickScale.set(tabId, { scaleX: 2, scaleY: 2 });
+
+    // from_screenshot:true converts image px to the CSS px the click fires at.
+    assert.deepEqual(
+      agent._resolveClickCoordsForLoop(tabId, { x: 100, y: 200, from_screenshot: true }),
+      { x: 200, y: 400 },
+      `${AgentClass.name}: from_screenshot coords not converted`,
+    );
+
+    // Without the flag, coords pass through unchanged.
+    assert.deepEqual(
+      agent._resolveClickCoordsForLoop(tabId, { x: 100, y: 200 }),
+      { x: 100, y: 200 },
+      `${AgentClass.name}: non-screenshot coords not passed through`,
+    );
+
+    // Flag set but no stored scale: no conversion.
+    agent.screenshotClickScale.delete(tabId);
+    assert.deepEqual(
+      agent._resolveClickCoordsForLoop(tabId, { x: 100, y: 200, from_screenshot: true }),
+      { x: 100, y: 200 },
+      `${AgentClass.name}: no stored scale should pass through`,
+    );
+  }
+});
+
+test('coord click loop: batch flow feeds converted CSS px into the loop detector', async () => {
+  for (const [label, AgentClass] of [['chrome', AgentCh], ['firefox', AgentFx]]) {
+    const agent = new AgentClass({ getVisionProvider: async () => null });
+    const tabId = label === 'chrome' ? 52705 : 52706;
+    agent._persist = () => {};
+    agent._skipPermissionGate = true;
+    agent.screenshotClickScale.set(tabId, { scaleX: 2, scaleY: 2 });
+    const seen = [];
+    agent._checkCoordClickLoop = (tid, x, y) => {
+      seen.push([x, y]);
+      return { kind: 'none' };
+    };
+    agent.executeTool = async () => ({ success: true });
+    agent._preflightRichTextToolbarTarget = async () => ({ block: null });
+
+    const messages = [];
+    await agent._executeToolBatch(
+      tabId,
+      [
+        {
+          id: 'loop_click_1',
+          function: { name: 'click', arguments: JSON.stringify({ x: 100, y: 200, from_screenshot: true }) },
+        },
+        {
+          id: 'loop_click_2',
+          function: { name: 'click', arguments: JSON.stringify({ x: 101, y: 201, from_screenshot: true }) },
+        },
+        {
+          id: 'loop_click_3',
+          function: { name: 'click', arguments: JSON.stringify({ x: 50, y: 60 }) },
+        },
+      ],
+      messages,
+      () => {},
+      { supportsVision: false },
+      null,
+      new Set(['click']),
+      1,
+    );
+
+    // The downscaled-screenshot clicks land on CSS pixels, not image pixels:
+    // (100,200) and (101,201) are distinct image pixels but collapse to the
+    // same CSS bucket, so the detector must be fed the converted values.
+    assert.deepEqual(
+      seen,
+      [[200, 400], [202, 402], [50, 60]],
+      `${label}: detector did not see the converted click points`,
+    );
+  }
+});
+
 test('visual target resolution stays private across Chrome and Firefox tools and prompts', () => {
   for (const [label, getTools, prompts] of [
     ['chrome', getToolsForModeCh, [

@@ -6559,7 +6559,8 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       }
       let coordCheck = { kind: 'none' };
       if (fnName === 'click' && fnArgs?.x != null && fnArgs?.y != null) {
-        coordCheck = this._checkCoordClickLoop(tabId, fnArgs.x, fnArgs.y);
+        const point = this._resolveClickCoordsForLoop(tabId, fnArgs);
+        coordCheck = this._checkCoordClickLoop(tabId, point.x, point.y);
       }
       const axReadCheck = this._checkAccessibilityReadLoop(tabId, fnName, fnArgs, toolResult);
       const scrollCheck = this._checkNoProgressScroll(tabId, fnName, fnArgs, toolResult);
@@ -8672,6 +8673,21 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       y: Math.round(y * scale.scaleY),
       converted: true,
     };
+  }
+
+  /**
+   * Resolve the point a click call will actually dispatch at, for loop
+   * detection. Loop detection must measure the same CSS-pixel point the
+   * click dispatches: under downscaled screenshots the model's image-pixel
+   * nudges collapse to the same CSS pixel and the detector must see that,
+   * otherwise "slightly different spot" clicks never register as the loop
+   * they are. Non-numeric args fall back to Number() so the batch guard
+   * (x != null) and the detector keep their existing shape.
+   */
+  _resolveClickCoordsForLoop(tabId, args) {
+    const mapped = this._screenshotClickCoords(tabId, args);
+    if (!mapped) return { x: Number(args.x), y: Number(args.y) };
+    return { x: mapped.x, y: mapped.y };
   }
 
   _coordinateReconciliationDiagnostic(point, resolution, clickPath, fallbackReason) {
