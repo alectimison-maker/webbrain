@@ -44,7 +44,7 @@ import {
   workflowRequiredRowsAreProcessed,
 } from './adapter-workflow-evidence.js';
 import { messageTargetMatchesObservedIdentities, normalizeMessageTarget } from './message-recipient-guard.js';
-import { advanceChatSession, createChatSession, decideChatSend, markChatSendPending } from './chat-workflow.js';
+import { advanceChatSession, createChatSession, decideChatSend, markChatSendPending, normalizeChatSession, serializeChatSession } from './chat-workflow.js';
 import {
   fetchUrl,
   executeHttpSkillTool,
@@ -12186,7 +12186,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
   }
 
   async _hydrateFromSession(tabId) {
-    const conversationInMemory = this.conversations.has(tabId);
+    const conversationInMemory = this.conversations.has(tabId) || this.chatSessions.has(tabId);
     try {
       const key = this._convKey(tabId);
       const cloudflareKey = cloudflareManagedChallengeStorageKey(tabId);
@@ -12204,8 +12204,11 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       }
       if (conversationInMemory) return;
       const entry = stored?.[key];
-      if (entry && Array.isArray(entry.messages) && entry.messages.length > 0) {
-        this.conversations.set(tabId, entry.messages);
+      if (entry && ((Array.isArray(entry.messages) && entry.messages.length > 0) || entry.chatWorkflow)) {
+        if (Array.isArray(entry.messages) && entry.messages.length > 0) this.conversations.set(tabId, entry.messages);
+        if (entry.chatWorkflow && typeof entry.chatWorkflow === 'object') {
+          this.chatSessions.set(tabId, normalizeChatSession(entry.chatWorkflow));
+        }
         if (entry.mode) {
           this.conversationModes.set(tabId, entry.mode);
           this._conversationMode = entry.mode;
@@ -12319,7 +12322,8 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
 
   _conversationStorageEntry(tabId, options = {}) {
     const messages = this.conversations.get(tabId);
-    if (!messages) return null;
+    const chatWorkflow = this.chatSessions.get(tabId);
+    if (!messages && !chatWorkflow) return null;
     const conversationId = this.conversationIds.get(tabId) || null;
     const clarificationGuard = this._clarificationAuthorizationGuards.get(tabId);
     const persistedClarificationGuard = clarificationGuard?.source === 'timeout'
@@ -12344,11 +12348,13 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
           },
         }
       : null;
-    const activeTaskBinding = this._activeTaskBinding(messages);
-    const serialized = serializeConversationForSession(messages, {
-      maxBytes: options.maxBytes || SESSION_CONVERSATION_BUDGET_BYTES,
-      preserveMessageIndices: activeTaskBinding.pinnedIndices,
-    });
+    const activeTaskBinding = messages ? this._activeTaskBinding(messages) : { pinnedIndices: [] };
+    const serialized = messages
+      ? serializeConversationForSession(messages, {
+          maxBytes: options.maxBytes || SESSION_CONVERSATION_BUDGET_BYTES,
+          preserveMessageIndices: activeTaskBinding.pinnedIndices,
+        })
+      : { messages: [], compacted: false, bytes: 2 };
     const captchaGateState = this._captchaGateStates.get(tabId) || null;
     return {
       mode: this.conversationModes.get(tabId) || 'ask',
@@ -12356,6 +12362,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       sessionSnapshotCompacted: serialized.compacted,
       sessionSnapshotBytes: serialized.bytes,
       conversationId,
+      chatWorkflow: chatWorkflow ? serializeChatSession(chatWorkflow) : null,
       workflowDraft: this._latestWorkflowDrafts.get(tabId) || null,
       submittedRunRequestId: this.submittedRunRequestIds.get(tabId) || null,
       progressLedger: this.progressLedgers.get(tabId) || [],
@@ -17672,6 +17679,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
     const prior = this.chatSessions.get(tabId) || createChatSession();
     const advanced = advanceChatSession(prior, observation);
     this.chatSessions.set(tabId, advanced.session);
+    this._persist(tabId);
     return {
       ...observation,
       chatWorkflow: this._chatWorkflowView(advanced),
@@ -17684,6 +17692,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
     const prior = this.chatSessions.get(tabId) || createChatSession();
     const observed = advanceChatSession(prior, before);
     this.chatSessions.set(tabId, observed.session);
+    this._persist(tabId);
     const workflow = () => this._chatWorkflowView(observed);
     const requestedThreadKey = String(args.thread_key || args.threadKey || '');
     if (!requestedThreadKey || requestedThreadKey !== before.threadKey) {
@@ -17720,6 +17729,23 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
 
     const pending = markChatSendPending(observed.session, decision);
     this.chatSessions.set(tabId, pending);
+    const pendingPersisted = await this._persistNow(tabId);
+    if (pendingPersisted !== true && pendingPersisted?.ok !== true) {
+      return {
+        success: false,
+        noDispatch: true,
+        dispatched: false,
+        reason: 'chat_state_not_durable',
+        error: 'Chat send blocked because the pending outbound message could not be persisted safely. Retry after storage is available.',
+        chatWorkflow: this._chatWorkflowView({
+          session: pending,
+          snapshot: before,
+          events: [],
+          newMessages: [],
+          nextAction: 'observe',
+        }),
+      };
+    }
     let dispatch;
     try {
       dispatch = await this.executeTool(tabId, 'set_field', {
@@ -17763,6 +17789,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
     }
     const verifiedState = advanceChatSession(pending, after);
     this.chatSessions.set(tabId, verifiedState.session);
+    this._persist(tabId);
     const outgoingVerified = verifiedState.newMessages.some(message => (
       message.direction === 'outgoing' && message.text === decision.text
     )) && verifiedState.session.pendingOutbound === null;

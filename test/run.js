@@ -5115,6 +5115,7 @@ test('model-callable chat tools bind the thread, send once, and require outgoing
 
     const agent = new AgentClass({});
     const tabId = label === 'chrome' ? 29811 : 29812;
+    agent._persistNow = async () => true;
     const observations = [baseSnapshot, baseSnapshot, afterSendSnapshot];
     agent._readChatObservation = async () => observations.shift() || afterSendSnapshot;
     const dispatched = [];
@@ -5166,6 +5167,7 @@ test('model-callable chat tools bind the thread, send once, and require outgoing
     assert.equal(driftDispatches, 0);
 
     const uncertainAgent = new AgentClass({});
+    uncertainAgent._persistNow = async () => true;
     uncertainAgent._readChatObservation = async () => ({ ...baseSnapshot });
     uncertainAgent.executeTool = async () => ({ success: true, dispatched: true });
     const uncertain = await uncertainAgent._sendChatWorkflow(tabId, {
@@ -5182,6 +5184,113 @@ test('model-callable chat tools bind the thread, send once, and require outgoing
       text: 'This will require verification.',
     });
     assert.equal(retry.reason, 'send_pending', `${label}: uncertain send became retryable without observation`);
+  }
+});
+
+test('chat workflow state survives worker restart and is durable before dispatch', async () => {
+  const previousChrome = globalThis.chrome;
+  const previousBrowser = globalThis.browser;
+  try {
+    for (const [index, [AgentClass, workflow, apiName]] of [
+      [0, [AgentCh, ChatWorkflowCh, 'chrome']],
+      [1, [AgentFx, ChatWorkflowFx, 'browser']],
+    ]) {
+      const tabId = 29820 + index;
+      const threadKey = `restart-case-${index}`;
+      const first = workflow.advanceChatSession(
+        workflow.createChatSession(),
+        {
+          threadId: threadKey,
+          agentConnected: true,
+          composer: { available: true, ref: `composer-${index}`, empty: true },
+          messages: [],
+        },
+      );
+      const pending = workflow.markChatSendPending(first.session, {
+        ok: true,
+        messageKey: `chatmsg_pending_${index}`,
+        threadKey,
+        text: 'Already waiting for delivery verification.',
+        attemptedAt: '2026-09-05T01:00:00.000Z',
+      });
+
+      const original = new AgentClass({});
+      original.conversations.set(tabId, [{ role: 'system', content: 'system' }]);
+      original.conversationIds.set(tabId, `conversation-${index}`);
+      original.chatSessions.set(tabId, pending);
+      const storedEntry = original._conversationStorageEntry(tabId);
+      assert.deepEqual(
+        storedEntry.chatWorkflow.pendingOutbound,
+        pending.pendingOutbound,
+        `${AgentClass.name}: chat workflow pending send was omitted from session storage`,
+      );
+
+      globalThis[apiName] = {
+        storage: {
+          session: {
+            get: async key => ({ [key]: storedEntry }),
+            set: async () => {},
+          },
+        },
+      };
+      const restarted = new AgentClass({});
+      restarted._persist = () => {};
+      await restarted._hydrate(tabId);
+      assert.equal(
+        restarted.chatSessions.get(tabId)?.threadKey,
+        threadKey,
+        `${AgentClass.name}: worker restart lost the chat thread binding`,
+      );
+      assert.deepEqual(
+        restarted.chatSessions.get(tabId)?.pendingOutbound,
+        pending.pendingOutbound,
+        `${AgentClass.name}: worker restart lost the pending outbound send`,
+      );
+
+      const sender = new AgentClass({});
+      sender.conversations.set(tabId, [{ role: 'system', content: 'system' }]);
+      sender.conversationIds.set(tabId, `conversation-send-${index}`);
+      sender.chatSessions.set(tabId, first.session);
+      sender._persist = () => {};
+      const baseSnapshot = {
+        success: true,
+        threadKey,
+        composer: { available: true, ref: `composer-${index}`, empty: true },
+        agentConnected: true,
+        userInput: null,
+        resolutionEvidence: { refund: null, autoRenewal: null, caseNumber: null },
+        messages: [],
+      };
+      const afterSendSnapshot = {
+        ...baseSnapshot,
+        messages: [{ id: `out-${index}`, direction: 'outgoing', text: 'Send once.' }],
+      };
+      const observations = [baseSnapshot, afterSendSnapshot];
+      sender._readChatObservation = async () => observations.shift() || afterSendSnapshot;
+      const writes = [];
+      globalThis[apiName].storage.session.set = async patch => writes.push(patch);
+      sender.executeTool = async () => {
+        assert.equal(writes.length, 1, `${AgentClass.name}: send dispatched before pending state was durable`);
+        assert.equal(
+          writes[0][sender._convKey(tabId)].chatWorkflow.pendingOutbound.text,
+          'Send once.',
+          `${AgentClass.name}: durable pending state did not contain the exact outbound text`,
+        );
+        return { success: true, dispatched: true };
+      };
+      const sent = await sender._sendChatWorkflow(tabId, {
+        thread_key: threadKey,
+        composer_ref: `composer-${index}`,
+        text: 'Send once.',
+      });
+      assert.equal(sent.deliveryVerified, true, `${AgentClass.name}: durable send did not verify delivery`);
+      assert.equal(sender.chatSessions.get(tabId)?.pendingOutbound, null, `${AgentClass.name}: pending send remained after verification`);
+    }
+  } finally {
+    if (previousChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = previousChrome;
+    if (previousBrowser === undefined) delete globalThis.browser;
+    else globalThis.browser = previousBrowser;
   }
 });
 
