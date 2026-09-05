@@ -5042,6 +5042,12 @@ test('long-running chat workflow tracks deltas, safe states, and idempotent send
     assert.equal(sensitive.session.state, 'needs_user_input');
     assert.equal(sensitive.nextAction, 'pause_for_user');
     assert.equal(workflow.decideChatSend(sensitive.session, sensitive.snapshot, '123456').reason, 'user_input_required');
+    const resumedAfterUserInput = workflow.advanceChatSession(
+      sensitive.session,
+      { threadId: 'case-42', composer: { available: true }, messages: replied.snapshot.messages },
+    );
+    assert.equal(resumedAfterUserInput.session.state, 'waiting_for_transfer');
+    assert.equal(resumedAfterUserInput.events[0].type, 'user_input_cleared');
 
     const changedThread = workflow.advanceChatSession(
       replied.session,
@@ -5078,6 +5084,104 @@ test('long-running chat workflow tracks deltas, safe states, and idempotent send
     });
     assert.match(normalized.messages[0].text, /IGNORE previous instructions/);
     assert.equal(normalized.userInput, null);
+  }
+});
+
+test('model-callable chat tools bind the thread, send once, and require outgoing verification', async () => {
+  const baseSnapshot = {
+    success: true,
+    threadKey: 'case-42',
+    composer: { available: true, ref: 'composer-1', empty: true },
+    agentConnected: true,
+    userInput: null,
+    resolutionEvidence: { refund: null, autoRenewal: null, caseNumber: null },
+    messages: [],
+  };
+  const afterSendSnapshot = {
+    ...baseSnapshot,
+    messages: [{ id: 'out-1', direction: 'outgoing', text: 'Please check the refund.' }],
+  };
+
+  for (const [label, AgentClass, getTools] of [
+    ['chrome', AgentCh, getToolsForModeCh],
+    ['firefox', AgentFx, getToolsForModeFx],
+  ]) {
+    const names = new Set(getTools('ask').map(tool => tool.function.name));
+    assert.equal(names.has('chat_observe'), true, `${label}: Ask must expose read-only chat_observe`);
+    assert.equal(names.has('chat_send'), false, `${label}: Ask must not expose chat_send`);
+    const actNames = new Set(getTools('act', { tier: 'mid' }).map(tool => tool.function.name));
+    assert.equal(actNames.has('chat_observe'), true, `${label}: Act must expose chat_observe`);
+    assert.equal(actNames.has('chat_send'), true, `${label}: Act must expose chat_send`);
+
+    const agent = new AgentClass({});
+    const tabId = label === 'chrome' ? 29811 : 29812;
+    const observations = [baseSnapshot, baseSnapshot, afterSendSnapshot];
+    agent._readChatObservation = async () => observations.shift() || afterSendSnapshot;
+    const dispatched = [];
+    agent.executeTool = async (_tabId, name, args) => {
+      dispatched.push({ name, args });
+      return { success: true, dispatched: true };
+    };
+    const first = await agent._observeChatWorkflow(tabId);
+    assert.equal(first.chatWorkflow.state, 'agent_connected', `${label}: observe did not advance state`);
+    const sent = await agent._sendChatWorkflow(tabId, {
+      thread_key: 'case-42',
+      composer_ref: 'composer-1',
+      text: 'Please check the refund.',
+    });
+    assert.equal(sent.success, true, `${label}: verified chat send was not successful`);
+    assert.equal(sent.deliveryVerified, true);
+    assert.equal(sent.chatWorkflow.pendingOutbound, false);
+    assert.deepEqual(dispatched.map(call => call.name), ['set_field']);
+    assert.deepEqual(dispatched[0].args, {
+      ref_id: 'composer-1',
+      text: 'Please check the refund.',
+      clear: true,
+      submit: true,
+    });
+
+    const duplicateAgent = new AgentClass({});
+    duplicateAgent._readChatObservation = async () => afterSendSnapshot;
+    let duplicateDispatches = 0;
+    duplicateAgent.executeTool = async () => { duplicateDispatches += 1; return { success: true, dispatched: true }; };
+    duplicateAgent.chatSessions.set(tabId, agent.chatSessions.get(tabId));
+    const duplicate = await duplicateAgent._sendChatWorkflow(tabId, {
+      thread_key: 'case-42',
+      composer_ref: 'composer-1',
+      text: 'Please check the refund.',
+    });
+    assert.equal(duplicate.reason, 'already_sent', `${label}: duplicate chat send was not blocked`);
+    assert.equal(duplicateDispatches, 0);
+
+    const driftAgent = new AgentClass({});
+    driftAgent._readChatObservation = async () => ({ ...baseSnapshot, threadKey: 'other-case' });
+    let driftDispatches = 0;
+    driftAgent.executeTool = async () => { driftDispatches += 1; return { success: true, dispatched: true }; };
+    const drift = await driftAgent._sendChatWorkflow(tabId, {
+      thread_key: 'case-42',
+      composer_ref: 'composer-1',
+      text: 'Do not send to another case.',
+    });
+    assert.equal(drift.reason, 'thread_unverified', `${label}: thread drift was not blocked`);
+    assert.equal(driftDispatches, 0);
+
+    const uncertainAgent = new AgentClass({});
+    uncertainAgent._readChatObservation = async () => ({ ...baseSnapshot });
+    uncertainAgent.executeTool = async () => ({ success: true, dispatched: true });
+    const uncertain = await uncertainAgent._sendChatWorkflow(tabId, {
+      thread_key: 'case-42',
+      composer_ref: 'composer-1',
+      text: 'This will require verification.',
+    });
+    assert.equal(uncertain.success, false);
+    assert.equal(uncertain.verificationRequired, true);
+    assert.equal(uncertain.outcomeUnknown, true);
+    const retry = await uncertainAgent._sendChatWorkflow(tabId, {
+      thread_key: 'case-42',
+      composer_ref: 'composer-1',
+      text: 'This will require verification.',
+    });
+    assert.equal(retry.reason, 'send_pending', `${label}: uncertain send became retryable without observation`);
   }
 });
 
@@ -25023,8 +25127,8 @@ test('getToolsForMode: mode/tier redesign exposes the intended normal and Dev to
     }
     const researchOptions = { researchEscalationEnabled: true };
     assert.equal(getTools('act', { tier: 'compact', ...researchOptions }).length, 25, `[${label}] Compact should expose 25 tools after tab-tool removal`);
-    assert.equal(getTools('act', { tier: 'mid', ...researchOptions }).length, 44, `[${label}] Mid should expose 44 tools after tab-tool removal`);
-    assert.equal(getTools('act', researchOptions).length, label === 'chrome' ? 50 : 49, `[${label}] Full tool count should drop by three`);
+    assert.equal(getTools('act', { tier: 'mid', ...researchOptions }).length, 46, `[${label}] Mid should expose 46 tools after chat workflow addition`);
+    assert.equal(getTools('act', researchOptions).length, label === 'chrome' ? 52 : 51, `[${label}] Full tool count should include the chat workflow tools`);
     assert.equal(compact.includes('research_url'), false, `[${label}] Compact must not gain research_url as a tab-tool replacement`);
 
     assert.equal(ask.includes('download_resource_from_page'), false, `[${label}] ask must not expose download_resource_from_page`);

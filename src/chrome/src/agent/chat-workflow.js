@@ -33,6 +33,7 @@ export const CHAT_EVENT_TYPES = Object.freeze([
   'counterparty_replied',
   'resolution_verified',
   'user_input_required',
+  'user_input_cleared',
   'observation_only',
 ]);
 
@@ -260,6 +261,7 @@ export function transitionChatState(state, event) {
   const current = STATE_SET.has(state) ? state : 'waiting_for_transfer';
   const type = EVENT_SET.has(event?.type) ? event.type : 'observation_only';
   if (type === 'user_input_required' || type === 'thread_changed') return 'needs_user_input';
+  if (type === 'user_input_cleared' && current === 'needs_user_input') return 'waiting_for_transfer';
   if (type === 'resolution_verified') return 'issue_resolved';
   if (current === 'stopped' || current === 'issue_resolved') return current;
   if (type === 'counterparty_replied') return 'counterparty_replied';
@@ -296,16 +298,21 @@ export function advanceChatSession(value, rawSnapshot, now = Date.now()) {
 
   if (snapshot.userInput?.required) {
     events.push({ type: 'user_input_required', ...snapshot.userInput });
-  } else if (evidenceComplete(snapshot.resolutionEvidence)) {
-    events.push({ type: 'resolution_verified', evidence: snapshot.resolutionEvidence });
-  } else if (newIncoming.length) {
-    events.push({ type: 'counterparty_replied', messages: newIncoming.map(message => message.id) });
-  } else if (newOutgoing.length) {
-    events.push({ type: 'outgoing_verified', messages: newOutgoing.map(message => message.id) });
-  } else if (snapshot.agentConnected === true && session.state === 'waiting_for_transfer') {
-    events.push({ type: 'agent_connected' });
   } else {
-    events.push({ type: 'observation_only' });
+    if (session.state === 'needs_user_input' && session.stopReason !== 'thread_changed') {
+      events.push({ type: 'user_input_cleared' });
+    }
+    if (evidenceComplete(snapshot.resolutionEvidence)) {
+      events.push({ type: 'resolution_verified', evidence: snapshot.resolutionEvidence });
+    } else if (newIncoming.length) {
+      events.push({ type: 'counterparty_replied', messages: newIncoming.map(message => message.id) });
+    } else if (newOutgoing.length) {
+      events.push({ type: 'outgoing_verified', messages: newOutgoing.map(message => message.id) });
+    } else if (snapshot.agentConnected === true && session.state === 'waiting_for_transfer') {
+      events.push({ type: 'agent_connected' });
+    } else if (events.length === 0) {
+      events.push({ type: 'observation_only' });
+    }
   }
 
   let nextState = session.state;
@@ -321,7 +328,9 @@ export function advanceChatSession(value, rawSnapshot, now = Date.now()) {
     resolutionEvidence: snapshot.resolutionEvidence,
     lastObservedAt: snapshot.observedAt,
     userInput: snapshot.userInput,
-    stopReason: snapshot.userInput?.required ? snapshot.userInput.reason : session.stopReason,
+    stopReason: snapshot.userInput?.required
+      ? snapshot.userInput.reason
+      : (events.some(event => event.type === 'user_input_cleared') ? '' : session.stopReason),
   };
   const nextAction = session.userInput?.required
     ? 'pause_for_user'
