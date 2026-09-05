@@ -5112,6 +5112,11 @@ test('model-callable chat tools bind the thread, send once, and require outgoing
     const actNames = new Set(getTools('act', { tier: 'mid' }).map(tool => tool.function.name));
     assert.equal(actNames.has('chat_observe'), true, `${label}: Act must expose chat_observe`);
     assert.equal(actNames.has('chat_send'), true, `${label}: Act must expose chat_send`);
+    const observeTool = getTools('act').find(tool => tool.function.name === 'chat_observe');
+    const sendTool = getTools('act').find(tool => tool.function.name === 'chat_send');
+    assert.match(observeTool.function.description, /nextAction is schedule_resume[\s\S]*after_seconds between 60 and 120/i, `${label}: chat_observe lacks durable waiting guidance`);
+    assert.match(observeTool.function.description, /consume only newMessages after a resume/i, `${label}: chat_observe lacks delta-only resume guidance`);
+    assert.match(sendTool.function.description, /schedule_resume for a 60–120 second durable pause/i, `${label}: chat_send lacks waiting guidance`);
 
     const agent = new AgentClass({});
     const tabId = label === 'chrome' ? 29811 : 29812;
@@ -5285,6 +5290,70 @@ test('chat workflow state survives worker restart and is durable before dispatch
       });
       assert.equal(sent.deliveryVerified, true, `${AgentClass.name}: durable send did not verify delivery`);
       assert.equal(sender.chatSessions.get(tabId)?.pendingOutbound, null, `${AgentClass.name}: pending send remained after verification`);
+    }
+  } finally {
+    if (previousChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = previousChrome;
+    if (previousBrowser === undefined) delete globalThis.browser;
+    else globalThis.browser = previousBrowser;
+  }
+});
+
+test('chat waiting persists before schedule_resume and fails closed when storage is unavailable', async () => {
+  const previousChrome = globalThis.chrome;
+  const previousBrowser = globalThis.browser;
+  try {
+    for (const [index, [AgentClass, workflow, apiName]] of [
+      [0, [AgentCh, ChatWorkflowCh, 'chrome']],
+      [1, [AgentFx, ChatWorkflowFx, 'browser']],
+    ]) {
+      const tabId = 29830 + index;
+      const threadKey = `waiting-case-${index}`;
+      const observed = workflow.advanceChatSession(
+        workflow.createChatSession(),
+        { threadId: threadKey, composer: { available: false }, messages: [] },
+      );
+      assert.equal(observed.nextAction, 'schedule_resume', `${AgentClass.name}: empty waiting chat did not request schedule_resume`);
+
+      const writes = [];
+      let scheduled = 0;
+      globalThis[apiName] = {
+        tabs: { get: async () => ({ url: 'https://support.example.test/cases/42', title: 'Case 42' }) },
+        storage: { session: { set: async patch => writes.push(patch), get: async () => ({}) } },
+      };
+      const agent = new AgentClass({});
+      agent.conversations.set(tabId, [{ role: 'system', content: 'system' }]);
+      agent.conversationIds.set(tabId, `conversation-waiting-${index}`);
+      agent.chatSessions.set(tabId, observed.session);
+      agent.scheduler = {
+        createResumeJob: async args => {
+          scheduled += 1;
+          assert.equal(writes.length, 1, `${AgentClass.name}: schedule_resume ran before chat state persistence`);
+          assert.equal(args.args.after_seconds, 90, `${AgentClass.name}: chat resume did not preserve the requested delay`);
+          assert.match(args.args.resume_instruction, /chat_observe/, `${AgentClass.name}: resume instruction did not restart with chat_observe`);
+          return { success: true, scheduled: true, jobId: `resume-${index}` };
+        },
+      };
+      const result = await agent.executeTool(tabId, 'schedule_resume', {
+        after_seconds: 90,
+        reason: 'Wait for the support agent to reply.',
+        resume_instruction: 'Resume by calling chat_observe, then handle only the new message delta.',
+      });
+      assert.equal(result.success, true, `${AgentClass.name}: chat waiting could not schedule a durable resume`);
+      assert.equal(scheduled, 1, `${AgentClass.name}: scheduler was not called exactly once`);
+
+      const blocked = new AgentClass({});
+      blocked.conversations.set(tabId, [{ role: 'system', content: 'system' }]);
+      blocked.chatSessions.set(tabId, observed.session);
+      blocked.scheduler = { createResumeJob: async () => { throw new Error('scheduler must not run'); } };
+      globalThis[apiName].storage.session.set = async () => { throw new Error('session unavailable'); };
+      const blockedResult = await blocked.executeTool(tabId, 'schedule_resume', {
+        after_seconds: 90,
+        reason: 'Wait safely.',
+        resume_instruction: 'Resume by calling chat_observe.',
+      });
+      assert.equal(blockedResult.reason, 'chat_state_not_durable', `${AgentClass.name}: unavailable chat state did not block resume scheduling`);
+      assert.equal(blockedResult.noDispatch, true, `${AgentClass.name}: unavailable chat state was not marked noDispatch`);
     }
   } finally {
     if (previousChrome === undefined) delete globalThis.chrome;

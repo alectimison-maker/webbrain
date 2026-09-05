@@ -22904,6 +22904,18 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
           error: 'Scheduling is not available in this build.',
         };
       }
+      if (this.chatSessions.has(tabId)) {
+        const chatStatePersisted = await this._persistNow(tabId);
+        if (chatStatePersisted !== true && chatStatePersisted?.ok !== true) {
+          return {
+            success: false,
+            dispatched: false,
+            noDispatch: true,
+            reason: 'chat_state_not_durable',
+            error: 'Resume scheduling blocked because the latest chat workflow state could not be persisted safely.',
+          };
+        }
+      }
       let tab = null;
       try { tab = await browser.tabs.get(tabId); } catch {}
       const result = await this.scheduler.createResumeJob({
