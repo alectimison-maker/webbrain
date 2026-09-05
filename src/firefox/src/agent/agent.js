@@ -2583,7 +2583,8 @@ export class Agent extends LoopDetector {
   }
 
   async _hydrateFromSession(tabId) {
-    const conversationInMemory = this.conversations.has(tabId) || this.chatSessions.has(tabId);
+    const conversationInMemory = this.conversations.has(tabId);
+    const chatWorkflowInMemory = this.chatSessions.has(tabId);
     try {
       const key = this._convKey(tabId);
       const cloudflareKey = cloudflareManagedChallengeStorageKey(tabId);
@@ -2599,8 +2600,13 @@ export class Agent extends LoopDetector {
         const cloudflareGate = cloudflareManagedChallengeGateState(cloudflareSignal);
         if (cloudflareGate) this._captchaGateStates.set(tabId, cloudflareGate);
       }
-      if (conversationInMemory) return;
       const entry = stored?.[key];
+      if (conversationInMemory || chatWorkflowInMemory) {
+        if (!chatWorkflowInMemory && entry?.chatWorkflow && typeof entry.chatWorkflow === 'object') {
+          this.chatSessions.set(tabId, normalizeChatSession(entry.chatWorkflow));
+        }
+        return;
+      }
       if (entry && ((Array.isArray(entry.messages) && entry.messages.length > 0) || entry.chatWorkflow)) {
         if (Array.isArray(entry.messages) && entry.messages.length > 0) this.conversations.set(tabId, entry.messages);
         if (entry.chatWorkflow && typeof entry.chatWorkflow === 'object') {

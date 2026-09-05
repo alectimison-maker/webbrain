@@ -5252,6 +5252,15 @@ test('chat workflow state survives worker restart and is durable before dispatch
         `${AgentClass.name}: worker restart lost the pending outbound send`,
       );
 
+      const residentConversation = new AgentClass({});
+      residentConversation.conversations.set(tabId, storedEntry.messages);
+      await residentConversation._hydrate(tabId);
+      assert.equal(
+        residentConversation.chatSessions.get(tabId)?.threadKey,
+        threadKey,
+        `${AgentClass.name}: hydration skipped chat state when conversation messages were already resident`,
+      );
+
       const sender = new AgentClass({});
       sender.conversations.set(tabId, [{ role: 'system', content: 'system' }]);
       sender.conversationIds.set(tabId, `conversation-send-${index}`);
