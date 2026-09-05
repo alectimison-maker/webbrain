@@ -24559,6 +24559,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       files: [
         'src/content/rich-text-toolbar-heuristic.js',
         'src/content/accessibility-tree.js',
+        'src/content/chat-observation.js',
         'src/content/content.js',
         'src/content/agent-visual-indicator.js',
       ],

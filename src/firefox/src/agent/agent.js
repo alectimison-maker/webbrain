@@ -26159,6 +26159,9 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       file: 'src/content/accessibility-tree.js',
     });
     await browser.tabs.executeScript(tabId, {
+      file: 'src/content/chat-observation.js',
+    });
+    await browser.tabs.executeScript(tabId, {
       file: 'src/content/content.js',
     });
     await browser.tabs.executeScript(tabId, {
