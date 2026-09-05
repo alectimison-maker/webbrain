@@ -163,7 +163,8 @@
     if (fromComposer) return fromComposer;
     const activeMarker = queryMany(root, THREAD_ID_ATTRIBUTES.map(name => `[${name}]`))
       .filter(node => visible(node))
-      .find(node => attribute(node, 'aria-current').toLowerCase() !== 'false'
+      .find(node => (node.hasAttribute?.('aria-current')
+          && attribute(node, 'aria-current').toLowerCase() !== 'false')
         || attribute(node, 'aria-selected').toLowerCase() === 'true');
     return firstAttribute(activeMarker ? [activeMarker] : [], THREAD_ID_ATTRIBUTES)
       || firstAttribute([root], THREAD_ID_ATTRIBUTES);
@@ -214,7 +215,12 @@
     const tag = String(node.tagName || '').toLowerCase();
     if (['button', 'input', 'textarea', 'select', 'option', 'nav', 'header', 'aside'].includes(tag)) return true;
     try {
-      return !!node.closest?.('button,[role="button"],[role="navigation"],nav,header,aside,[aria-live],[role="alert"]');
+      // Chat transcripts are routinely wrapped in a single aria-live/log
+      // region, so an announcing ancestor cannot disqualify its messages.
+      // Only the node itself counts as a status region; interactive and
+      // navigational ancestors still do.
+      if (node.matches?.('[aria-live],[role="alert"],[role="status"]')) return true;
+      return !!node.closest?.('button,[role="button"],[role="navigation"],nav,header,aside');
     } catch {
       return false;
     }
@@ -270,7 +276,9 @@
       }
     }
 
-    return selected.slice(0, MAX_ITEMS).map(item => ({
+    // The kernel keeps the last MAX_ITEMS entries, so the newest bubbles —
+    // not the oldest — must survive the cap in a long conversation.
+    return selected.slice(-MAX_ITEMS).map(item => ({
       ...(item.id ? { id: item.id } : {}),
       direction: item.direction,
       text: item.text,
@@ -306,7 +314,7 @@
       if (/otp|one[-_ ]?time|verification[-_ ]?code|security[-_ ]?code/.test(explicit)
         || autocomplete.includes('one-time-code')
         || /otp|one[-_ ]?time|verification[-_ ]?code|security[-_ ]?code/.test(semantic)) reason = 'otp';
-      else if (/pin/.test(explicit) || /pin/.test(semantic)) reason = 'pin';
+      else if (/pin/.test(explicit) || /(?:^|[^a-z0-9])pin(?:$|[^a-z0-9])/.test(semantic)) reason = 'pin';
       else if (/payment|cc-|credit[-_ ]?card|cvc|cvv/.test(explicit)
         || /cc-|credit[-_ ]?card|cvc|cvv/.test(autocomplete)
         || /payment|credit[-_ ]?card|cvc|cvv/.test(semantic)) reason = 'payment';
@@ -314,7 +322,7 @@
         || node.hasAttribute?.('data-new-user-decision-required')) reason = 'new_user_decision';
       else if (type === 'password'
         || /authentication|auth|password|login|sign[-_ ]?in/.test(explicit)
-        || /authentication|auth|password|login|sign[-_ ]?in/.test(semantic)) reason = 'authentication';
+        || /(?:^|[^a-z0-9])(?:authentication|auth|password|login|sign[-_ ]?in)(?:$|[^a-z0-9])/.test(semantic)) reason = 'authentication';
       if (!reason) continue;
       const messages = {
         otp: 'A one-time code or verification code requires the user.',

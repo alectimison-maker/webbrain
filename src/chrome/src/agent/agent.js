@@ -17711,8 +17711,12 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
         chatWorkflow: workflow(),
       };
     }
-    const composerRef = String(args.composer_ref || args.composerRef || before.composer?.ref || '');
-    if (!composerRef || (before.composer?.ref && composerRef !== before.composer.ref)) {
+    // The observed ref is the only trusted binding. Without it a caller-supplied
+    // ref would be typed into an unverified element, so require both and match.
+    const observedComposerRef = String(before.composer?.ref || '');
+    const requestedComposerRef = String(args.composer_ref || args.composerRef || '');
+    const composerRef = requestedComposerRef || observedComposerRef;
+    if (!observedComposerRef || composerRef !== observedComposerRef) {
       return {
         success: false,
         noDispatch: true,

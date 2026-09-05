@@ -54,6 +54,9 @@ const USER_INPUT_REASON_SET = new Set(CHAT_USER_INPUT_REASONS);
 const MAX_MESSAGES = 200;
 const MAX_MESSAGE_TEXT = 4_000;
 const MAX_ID = 240;
+// A dispatch that never produced a visible bubble must not block the same text
+// forever. `attemptedAt` ages the pending record out so the workflow can retry.
+const PENDING_OUTBOUND_TTL_MS = 10 * 60 * 1000;
 
 function bounded(value, max = MAX_ID) {
   return String(value ?? '')
@@ -221,6 +224,13 @@ export function createChatSession({ threadKey = '', now = Date.now() } = {}) {
   return session;
 }
 
+function pendingOutboundExpired(pending, now) {
+  if (!pending) return false;
+  const attempted = Date.parse(pending.attemptedAt || '');
+  if (!Number.isFinite(attempted)) return true;
+  return now - attempted > PENDING_OUTBOUND_TTL_MS;
+}
+
 export function normalizeChatSession(value, now = Date.now()) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const state = STATE_SET.has(source.state) ? source.state : 'waiting_for_transfer';
@@ -324,7 +334,9 @@ export function advanceChatSession(value, rawSnapshot, now = Date.now()) {
     state: nextState,
     seenMessageIds: [...new Set([...session.seenMessageIds, ...snapshot.messages.map(message => message.id)])].slice(-MAX_MESSAGES),
     sentMessageKeys: [...outgoingKeys].slice(-MAX_MESSAGES),
-    pendingOutbound: matchedPending ? null : session.pendingOutbound,
+    pendingOutbound: matchedPending || pendingOutboundExpired(session.pendingOutbound, now)
+      ? null
+      : session.pendingOutbound,
     resolutionEvidence: snapshot.resolutionEvidence,
     lastObservedAt: snapshot.observedAt,
     userInput: snapshot.userInput,
@@ -347,7 +359,9 @@ export function advanceChatSession(value, rawSnapshot, now = Date.now()) {
 export function decideChatSend(value, rawSnapshot, text, now = Date.now()) {
   const session = normalizeChatSession(value, now);
   const snapshot = normalizeChatSnapshot(rawSnapshot, now);
-  const body = normalizeChatText(text);
+  // Normalize one character past the cap so an over-long body is rejected
+  // rather than silently truncated into a different message than requested.
+  const body = normalizeChatText(text, MAX_MESSAGE_TEXT + 1);
   if (!body) return { ok: false, reason: 'empty_message', error: 'A non-empty chat message is required.' };
   if (body.length > MAX_MESSAGE_TEXT) return { ok: false, reason: 'message_too_long', error: 'Chat messages must be 4,000 characters or fewer.' };
   if (session.userInput?.required || snapshot.userInput?.required) {
@@ -367,7 +381,7 @@ export function decideChatSend(value, rawSnapshot, text, now = Date.now()) {
       || snapshot.messages.some(message => message.direction === 'outgoing' && messageKey(snapshot.threadKey, message.text) === key)) {
     return { ok: false, duplicate: true, reason: 'already_sent', messageKey: key, error: 'This exact message is already visible as an outgoing message in this conversation.' };
   }
-  if (session.pendingOutbound?.key === key) {
+  if (session.pendingOutbound?.key === key && !pendingOutboundExpired(session.pendingOutbound, now)) {
     return { ok: false, duplicate: true, pending: true, reason: 'send_pending', messageKey: key, error: 'This exact message is already pending verification; observe the conversation before retrying.' };
   }
   return { ok: true, messageKey: key, threadKey: snapshot.threadKey, text: body, attemptedAt: new Date(now).toISOString() };
